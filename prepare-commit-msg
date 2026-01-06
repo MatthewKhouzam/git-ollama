@@ -1,0 +1,57 @@
+#!/bin/bash
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+
+echo "Hook called: $1 $2" >> /tmp/hook_debug.log
+
+# Only run for regular commits (not merge, squash, etc.)
+# Allow commits with -s flag (COMMIT_SOURCE will be empty)
+if [ "$COMMIT_SOURCE" = "merge" ] || [ "$COMMIT_SOURCE" = "squash" ] || [ "$COMMIT_SOURCE" = "commit" ]; then
+    echo "Exiting due to commit source: $COMMIT_SOURCE" >> /tmp/hook_debug.log
+    exit 0
+fi
+
+# Get the staged diff
+DIFF=$(git diff --cached)
+
+if [ -z "$DIFF" ]; then
+    echo "No diff found" >> /tmp/hook_debug.log
+    exit 0
+fi
+
+echo "Diff found, calling LLM" >> /tmp/hook_debug.log
+
+# Generate commit message using LLM
+ESCAPED_DIFF=$(echo "$DIFF" | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n')
+echo "Calling LLM with escaped diff length: ${#ESCAPED_DIFF}" >> /tmp/hook_debug.log
+
+COMMIT_MSG=$(curl -s -X POST http://localhost:11434/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"model\": \"gemma3:1b\",
+        \"messages\": [{
+            \"role\": \"user\",
+            \"content\": \"Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:\\n\\n${ESCAPED_DIFF}\"
+        }],
+        \"max_tokens\": 100,
+        \"temperature\": 0.3
+    }" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data['choices'][0]['message']['content'].strip())
+except Exception as e:
+    print('Error: ' + str(e), file=sys.stderr)
+    print('AI-generated commit message')
+")
+
+echo "LLM response: '$COMMIT_MSG'" >> /tmp/hook_debug.log
+
+# Prepend AI-generated message to existing commit message file
+if [ -n "$COMMIT_MSG" ]; then
+    echo "$COMMIT_MSG" > "$COMMIT_MSG_FILE.tmp"
+    echo "" >> "$COMMIT_MSG_FILE.tmp"
+    cat "$COMMIT_MSG_FILE" >> "$COMMIT_MSG_FILE.tmp"
+    mv "$COMMIT_MSG_FILE.tmp" "$COMMIT_MSG_FILE"
+fi

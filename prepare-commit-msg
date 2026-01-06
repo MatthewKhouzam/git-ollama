@@ -23,29 +23,41 @@ fi
 echo "Diff found, calling LLM" >> /tmp/hook_debug.log
 
 # Generate commit message using LLM
-ESCAPED_DIFF=$(echo "$DIFF" | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n')
-echo "Calling LLM with escaped diff length: ${#ESCAPED_DIFF}" >> /tmp/hook_debug.log
+TEMP_DIFF=$(mktemp)
+echo "$DIFF" > "$TEMP_DIFF"
 
-COMMIT_MSG=$(curl -s -X POST http://localhost:11434/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d "{
-        \"model\": \"gemma3:1b\",
-        \"messages\": [{
-            \"role\": \"user\",
-            \"content\": \"Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:\\n\\n${ESCAPED_DIFF}\"
-        }],
-        \"max_tokens\": 100,
-        \"temperature\": 0.3
-    }" | python3 -c "
-import sys, json
+COMMIT_MSG=$(python3 -c "
+import json, subprocess, sys
+
+with open('$TEMP_DIFF', 'r') as f:
+    diff = f.read()
+
+payload = {
+    'model': 'gemma3:1b',
+    'messages': [{
+        'role': 'user',
+        'content': f'Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:\\n\\n{diff}'
+    }],
+    'max_tokens': 100,
+    'temperature': 0.3
+}
+
 try:
-    data = json.load(sys.stdin)
-    print(data['choices'][0]['message']['content'].strip())
+    result = subprocess.run(['curl', '-s', '-X', 'POST', 'http://localhost:11434/v1/chat/completions',
+                           '-H', 'Content-Type: application/json',
+                           '-d', json.dumps(payload)], 
+                          capture_output=True, text=True)
+    
+    if result.returncode == 0:
+        data = json.loads(result.stdout)
+        print(data['choices'][0]['message']['content'].strip())
+    else:
+        print('AI-generated commit message')
 except Exception as e:
-    print('Error: ' + str(e), file=sys.stderr)
     print('AI-generated commit message')
 ")
 
+rm -f "$TEMP_DIFF"
 echo "LLM response: '$COMMIT_MSG'" >> /tmp/hook_debug.log
 
 # Prepend AI-generated message to existing commit message file

@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# git-add-llm: Interactive git add with LLM explanations
+# Usage: git-add-llm [files...]
+
+LLM_HOST="127.0.0.1"
+LLM_PORT="11434"
+
+explain_chunk() {
+    local chunk="$1"
+    local escaped_chunk=$(echo "$chunk" | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n')
+    
+    local response=$(curl -s -X POST "http://${LLM_HOST}:${LLM_PORT}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\": \"gemma3:1b\",
+            \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"Briefly explain what this code change does in 1-2 sentences:\\n\\n${escaped_chunk}\"
+            }],
+            \"max_tokens\": 100,
+            \"temperature\": 0.3
+        }")
+    
+    echo "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data['choices'][0]['message']['content'].strip())
+except:
+    print('Error getting explanation from LLM')
+" 2>/dev/null
+}
+
+# Create temp files for patch processing
+PATCH_FILE=$(mktemp)
+APPLY_FILE=$(mktemp)
+trap "rm -f $PATCH_FILE $APPLY_FILE" EXIT
+
+# Handle untracked files by adding them with intent-to-add
+if [ $# -gt 0 ]; then
+    for file in "$@"; do
+        if [ -f "$file" ] && git ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+            : # File is tracked, do nothing
+        elif [ -f "$file" ]; then
+            git add -N "$file" 2>/dev/null
+        fi
+    done
+fi
+
+# Get unstaged changes
+git diff "$@" > "$PATCH_FILE"
+
+# If no unstaged changes, check for staged changes
+if [ ! -s "$PATCH_FILE" ]; then
+    if git rev-parse --verify HEAD >/dev/null 2>&1; then
+        git diff --cached HEAD "$@" > "$PATCH_FILE"
+    else
+        git diff --cached "$@" > "$PATCH_FILE"
+    fi
+fi
+
+if [ ! -s "$PATCH_FILE" ]; then
+    echo "No changes to stage"
+    exit 0
+fi
+
+# Process patch file hunk by hunk
+python3 -c "
+import sys
+file = index = minus = plus = hunk = ''
+with open('$PATCH_FILE') as f:
+    for line in f:
+        line = line.rstrip('\n')
+        if line.startswith('diff --git'):
+            file = line
+        elif line.startswith('index'):
+            index = line
+        elif line.startswith('---'):
+            minus = line
+        elif line.startswith('+++'):
+            plus = line
+        elif line.startswith('@@'):
+            if hunk:
+                print(file)
+                print(index)
+                print(minus)
+                print(plus)
+                print(hunk + 'HUNK_SEPARATOR')
+            hunk = line + '\n'
+        elif line and line[0] in ' +-':
+            hunk += line + '\n'
+    if hunk:
+        print(file)
+        print(index)
+        print(minus)
+        print(plus)
+        print(hunk + 'HUNK_SEPARATOR')
+" | {
+    current_hunk=""
+    while IFS= read -r line; do
+        if [[ "$line" == *"HUNK_SEPARATOR" ]]; then
+            hunk_content=${line%HUNK_SEPARATOR}
+            current_hunk="$current_hunk$hunk_content"
+            
+            echo -e "\n\033[33m=== Code Change ===\033[0m"
+            printf '%s\n' "$current_hunk"
+            
+            echo -e "\n\033[36m--- AI Explanation ---\033[0m"
+            explain_chunk "$current_hunk"
+            echo -e "\033[36m----------------------\033[0m"
+            
+            while true; do
+                echo -n "Stage this hunk? [y,n,q,a,d,?] "
+                read -r answer </dev/tty
+                case "$answer" in
+                    y|Y) 
+                        echo "$current_hunk" >> "$APPLY_FILE"
+                        echo "Staged."
+                        break
+                        ;;
+                    n|N) 
+                        echo "Skipped."
+                        break
+                        ;;
+                    q|Q) 
+                        echo "Quit"
+                        exit 0
+                        ;;
+                    a|A)
+                        echo "$current_hunk" >> "$APPLY_FILE"
+                        echo "Staged. Staging all remaining hunks..."
+                        cat >> "$APPLY_FILE"
+                        break 2
+                        ;;
+                    d|D)
+                        echo "Skipped. Skipping all remaining hunks..."
+                        break 2
+                        ;;
+                    \?)
+                        echo "y - stage this hunk"
+                        echo "n - do not stage this hunk"
+                        echo "q - quit; do not stage this hunk or any remaining ones"
+                        echo "a - stage this hunk and all later hunks in the file"
+                        echo "d - do not stage this hunk or any later hunks in the file"
+                        ;;
+                    *)
+                        echo "Invalid option. Use ? for help."
+                        ;;
+                esac
+            done
+            current_hunk=""
+        else
+            current_hunk="$current_hunk$line"$'\n'
+        fi
+    done
+}
+
+# Apply selected hunks
+if [ -s "$APPLY_FILE" ]; then
+    git apply --cached "$APPLY_FILE"
+    echo "Changes staged successfully."
+else
+    echo "No changes staged."
+fi

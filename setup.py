@@ -6,6 +6,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         "nltk>=3.8",
+        "tqdm>=4.0",
     ],
     entry_points={
         "console_scripts": [

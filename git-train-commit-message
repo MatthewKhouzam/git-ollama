@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+import re
+import json
+import os
+from collections import Counter, defaultdict
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+def load_ollama_config():
+    """Load Ollama configuration from config file and environment variables"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_file = os.path.join(script_dir, 'ollama-config.json')
+    
+    defaults = {
+        'host': '127.0.0.1',
+        'port': '11434',
+        'model': 'gemma3:1b',
+        'temperature': 0.3,
+        'max_tokens': 100,
+        'api_token': ''
+    }
+    
+    # Load from config file
+    config = defaults.copy()
+    try:
+        with open(config_file, 'r') as f:
+            file_config = json.load(f)
+            config.update(file_config)
+    except:
+        pass
+    
+    # Override with environment variables
+    config['host'] = os.environ.get('OLLAMA_HOST', config['host'])
+    config['port'] = os.environ.get('OLLAMA_PORT', config['port'])
+    config['model'] = os.environ.get('OLLAMA_MODEL', config['model'])
+    config['temperature'] = float(os.environ.get('OLLAMA_TEMPERATURE', config['temperature']))
+    config['max_tokens'] = int(os.environ.get('OLLAMA_MAX_TOKENS', config['max_tokens']))
+    config['api_token'] = os.environ.get('OLLAMA_API_TOKEN', config['api_token'])
+    
+    return config
+
+def ensure_nltk_data():
+    """Download required NLTK data if not present"""
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        print("Downloading required NLTK data...")
+        nltk.download('punkt', quiet=True)
+        nltk.download('stopwords', quiet=True)
+
+def get_commit_data():
+    """Get commit messages with their associated file changes"""
+    try:
+        # Get commit hashes and messages
+        result = subprocess.run(['git', 'log', '--pretty=format:%H|%B%n---COMMIT-END---'], 
+                              capture_output=True, text=True, check=True)
+        commits = result.stdout.strip().split('---COMMIT-END---')
+        
+        commit_data = []
+        for commit in commits:
+            if not commit.strip():
+                continue
+            
+            lines = commit.strip().split('\n')
+            if not lines:
+                continue
+                
+            # Parse hash and message
+            first_line = lines[0]
+            if '|' not in first_line:
+                continue
+                
+            commit_hash, message_start = first_line.split('|', 1)
+            full_message = message_start + '\n' + '\n'.join(lines[1:]) if len(lines) > 1 else message_start
+            
+            # Get files changed in this commit
+            try:
+                files_result = subprocess.run(['git', 'show', '--name-only', '--pretty=format:', commit_hash], 
+                                            capture_output=True, text=True, check=True)
+                files = [f.strip() for f in files_result.stdout.strip().split('\n') if f.strip()]
+            except subprocess.CalledProcessError:
+                files = []
+            
+            commit_data.append({
+                'hash': commit_hash,
+                'message': full_message.strip(),
+                'files': files
+            })
+        
+        # Add progress bar for file analysis if tqdm is available
+        if tqdm and len(commit_data) > 10:
+            print("Analyzing file changes...")
+            commit_data = list(tqdm(commit_data, desc="Processing commits"))
+        
+        return commit_data
+    except subprocess.CalledProcessError:
+        print("Error: Not a git repository or git command failed")
+        sys.exit(1)
+
+def analyze_commit_messages(commit_data):
+    """Analyze commit message patterns"""
+    messages = [commit['message'] for commit in commit_data]
+    
+    analysis = {
+        'total_commits': len(messages),
+        'signed_off_commits': 0,
+        'title_patterns': Counter(),
+        'first_words': Counter(),
+        'conventional_commits': Counter(),
+        'component_prefixes': Counter(),
+        'file_based_components': Counter(),
+        'avg_title_length': 0,
+        'has_description': 0,
+        'avg_description_length': 0,
+        'avg_description_line_length': 0
+    }
+    
+    ensure_nltk_data()
+    stop_words = set(stopwords.words('english'))
+    
+    title_lengths = []
+    description_lengths = []
+    description_line_lengths = []
+    
+    # Use progress bar if available and there are many commits
+    iterator = tqdm(enumerate(messages), total=len(messages), desc="Analyzing commits") if tqdm and len(messages) > 50 else enumerate(messages)
+    
+    for i, msg in iterator:
+        lines = msg.split('\n')
+        title = lines[0] if lines else ""
+        description = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ""
+        files = commit_data[i]['files'] if i < len(commit_data) else []
+        
+        # Check for Signed-off-by
+        if 'Signed-off-by:' in msg:
+            analysis['signed_off_commits'] += 1
+        
+        # Analyze title
+        if title:
+            title_lengths.append(len(title))
+            
+            # First word analysis
+            words = word_tokenize(title.lower())
+            if words:
+                first_word = words[0]
+                analysis['first_words'][first_word] += 1
+            
+            # Extract prefix for analysis (word before colon, or word in parentheses)
+            prefix = None
+            # Check for parentheses pattern: word(scope): or (word):
+            paren_match = re.match(r'^(\w+)?\(([^)]+)\)\s*:\s*', title)
+            if paren_match:
+                prefix = paren_match.group(2) if paren_match.group(1) else paren_match.group(2)
+            else:
+                # Check for colon pattern: word:
+                colon_match = re.match(r'^([^:\s]+)\s*:\s*', title)
+                if colon_match:
+                    prefix = colon_match.group(1)
+            
+            if prefix:
+                # Check if it's a conventional commit type
+                conventional_types = {'feat', 'fix', 'docs', 'style', 'refactor', 'test', 'chore', 'perf', 'ci', 'build', 'revert'}
+                if prefix.lower() in conventional_types:
+                    analysis['conventional_commits'][prefix.lower()] += 1
+                else:
+                    analysis['component_prefixes'][prefix] += 1
+            
+            # File-based component analysis
+            if files:
+                # Extract potential components from file paths
+                for file_path in files:
+                    parts = file_path.split('/')
+                    # Check if title starts with directory name or filename (without extension)
+                    for part in parts:
+                        if part and not part.startswith('.'):
+                            # Remove file extension
+                            component = re.sub(r'\.[^.]+$', '', part)
+                            if component and title.lower().startswith(component.lower()):
+                                analysis['file_based_components'][component] += 1
+                                break
+            
+            # Title pattern (general structure)
+            if ':' in title:
+                analysis['title_patterns']['has_colon'] += 1
+            if title.endswith('.'):
+                analysis['title_patterns']['ends_with_period'] += 1
+            if title[0].isupper():
+                analysis['title_patterns']['starts_uppercase'] += 1
+            if title[0].islower():
+                analysis['title_patterns']['starts_lowercase'] += 1
+        
+        # Analyze description
+        if description:
+            analysis['has_description'] += 1
+            description_lengths.append(len(description))
+            
+            # Analyze description line lengths
+            desc_lines = [line.strip() for line in description.split('\n') if line.strip()]
+            for line in desc_lines:
+                description_line_lengths.append(len(line))
+    
+    # Calculate averages
+    if title_lengths:
+        analysis['avg_title_length'] = sum(title_lengths) / len(title_lengths)
+    if description_lengths:
+        analysis['avg_description_length'] = sum(description_lengths) / len(description_lengths)
+    if description_line_lengths:
+        analysis['avg_description_line_length'] = sum(description_line_lengths) / len(description_line_lengths)
+    
+    return analysis
+
+def generate_commit_prompt(analysis):
+    """Generate a commit message prompt based on analysis"""
+    total = analysis['total_commits']
+    
+    # Determine dominant style
+    style_rules = []
+    
+    # Check for conventional commits
+    conv_total = sum(analysis['conventional_commits'].values())
+    if conv_total > total * 0.3:  # 30% threshold
+        top_types = [t for t, _ in analysis['conventional_commits'].most_common(5)]
+        style_rules.append(f"Use conventional commit format with types: {', '.join(top_types)}")
+    
+    # Check for component prefixes (traditional)
+    comp_total = sum(analysis['component_prefixes'].values())
+    if comp_total > total * 0.3:
+        top_comps = [c for c, _ in analysis['component_prefixes'].most_common(5)]
+        style_rules.append(f"Use component prefixes like: {', '.join(top_comps)}")
+    
+    # Check for file-based component naming
+    file_comp_total = sum(analysis['file_based_components'].values())
+    if file_comp_total > total * 0.2:  # Lower threshold since this is more specific
+        top_file_comps = [c for c, _ in analysis['file_based_components'].most_common(5)]
+        style_rules.append(f"Use file/directory-based prefixes like: {', '.join(top_file_comps)}")
+        style_rules.append("Consider using the main file or directory name being changed as a prefix")
+    
+    # Title case preference
+    upper_count = analysis['title_patterns'].get('starts_uppercase', 0)
+    lower_count = analysis['title_patterns'].get('starts_lowercase', 0)
+    if upper_count > lower_count * 1.5:
+        style_rules.append("Start with uppercase letter")
+    elif lower_count > upper_count * 1.5:
+        style_rules.append("Start with lowercase letter")
+    
+    # Period preference
+    period_count = analysis['title_patterns'].get('ends_with_period', 0)
+    if period_count > total * 0.7:
+        style_rules.append("End with period")
+    elif period_count < total * 0.1:
+        style_rules.append("Do not end with period")
+    
+    # Length preference
+    if analysis['avg_title_length'] > 0:
+        target_length = int(analysis['avg_title_length'])
+        style_rules.append(f"Keep title around {target_length} characters")
+    
+    # Description line length preference
+    if analysis['avg_description_line_length'] > 0:
+        target_line_length = int(analysis['avg_description_line_length'])
+        style_rules.append(f"Keep description lines around {target_line_length} characters")
+        style_rules.append("Break long descriptions into multiple lines")
+    
+    # Description preference
+    desc_pct = (analysis['has_description'] / total) if total > 0 else 0
+    if desc_pct > 0.5:
+        style_rules.append("Include detailed description when needed")
+    
+    # Signed-off preference
+    signed_pct = (analysis['signed_off_commits'] / total) if total > 0 else 0
+    if signed_pct > 0.8:
+        style_rules.append("Include Signed-off-by line")
+        
+    style_rules.append("Do not write code, write english prose.")
+    style_rules.append("Do not write the commit message in ``` backticks.")
+    
+    # Generate prompt
+    prompt = "Generate a git commit message following this project's style:\n\n"
+    
+    if style_rules:
+        prompt += "Style guidelines:\n"
+        for rule in style_rules:
+            prompt += f"- {rule}\n"
+        prompt += "\n"
+    
+    # Add common first words as examples
+    if analysis['first_words']:
+        top_words = [w for w, _ in analysis['first_words'].most_common(5)]
+        prompt += f"Common starting words: {', '.join(top_words)}\n\n"
+    
+    prompt += "Based on the following diff, write a commit message:"
+    
+    return prompt
+
+def save_commit_prompt(prompt):
+    """Save the commit prompt to .git directory"""
+    try:
+        git_dir = subprocess.run(['git', 'rev-parse', '--git-dir'], 
+                                capture_output=True, text=True, check=True).stdout.strip()
+        prompt_file = os.path.join(git_dir, 'commit-prompt.txt')
+        
+        with open(prompt_file, 'w') as f:
+            f.write(prompt)
+        
+        print(f"Commit prompt saved to: {prompt_file}")
+        return prompt_file
+    except subprocess.CalledProcessError:
+        print("Error: Could not find git directory")
+        return None
+
+def print_report(analysis):
+    """Print formatted analysis report"""
+    total = analysis['total_commits']
+    
+    print(f"=== Git Commit Message Style Analysis ===")
+    print(f"Total commits analyzed: {total}")
+    print()
+    
+    # Signed-off-by analysis
+    signed_pct = (analysis['signed_off_commits'] / total * 100) if total > 0 else 0
+    print(f"Signed-off-by: {analysis['signed_off_commits']}/{total} ({signed_pct:.1f}%)")
+    print()
+    
+    # Title analysis
+    print("=== Title Patterns ===")
+    print(f"Average title length: {analysis['avg_title_length']:.1f} characters")
+    
+    for pattern, count in analysis['title_patterns'].most_common():
+        pct = count / total * 100
+        print(f"  {pattern}: {count}/{total} ({pct:.1f}%)")
+    print()
+    
+    # First words analysis
+    print("=== Most Common First Words ===")
+    for word, count in analysis['first_words'].most_common(10):
+        pct = count / total * 100
+        print(f"  '{word}': {count} ({pct:.1f}%)")
+    print()
+    
+    # Conventional commits
+    if analysis['conventional_commits']:
+        print("=== Conventional Commit Types ===")
+        for commit_type, count in analysis['conventional_commits'].most_common():
+            pct = count / total * 100
+            print(f"  {commit_type}: {count} ({pct:.1f}%)")
+        print()
+    
+    # Component prefixes
+    if analysis['component_prefixes']:
+        print("=== Component Prefixes ===")
+        for component, count in analysis['component_prefixes'].most_common(10):
+            pct = count / total * 100
+            print(f"  {component}: {count} ({pct:.1f}%)")
+        print()
+    
+    # File-based components
+    if analysis['file_based_components']:
+        print("=== File-Based Component Prefixes ===")
+        for component, count in analysis['file_based_components'].most_common(10):
+            pct = count / total * 100
+            print(f"  {component}: {count} ({pct:.1f}%)")
+        print()
+    
+    # Description analysis
+    desc_pct = (analysis['has_description'] / total * 100) if total > 0 else 0
+    print("=== Description Patterns ===")
+    print(f"Commits with description: {analysis['has_description']}/{total} ({desc_pct:.1f}%)")
+    if analysis['avg_description_length'] > 0:
+        print(f"Average description length: {analysis['avg_description_length']:.1f} characters")
+    if analysis['avg_description_line_length'] > 0:
+        print(f"Average description line length: {analysis['avg_description_line_length']:.1f} characters")
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
+        print("Usage: git train-commit-message [--json]")
+        print("Analyzes commit message patterns in the current repository")
+        print("Generates a commit prompt file for consistent messaging")
+        print("  --json    Output analysis in JSON format")
+        sys.exit(0)
+    
+    json_output = len(sys.argv) > 1 and sys.argv[1] == '--json'
+    
+    config = load_ollama_config()
+    commit_data = get_commit_data()
+    if not commit_data:
+        print("No commit messages found")
+        sys.exit(1)
+    
+    analysis = analyze_commit_messages(commit_data)
+    
+    if json_output:
+        # Convert Counter objects to regular dicts for JSON serialization
+        json_analysis = {}
+        for key, value in analysis.items():
+            if isinstance(value, Counter):
+                json_analysis[key] = dict(value)
+            else:
+                json_analysis[key] = value
+        print(json.dumps(json_analysis, indent=2))
+    else:
+        print_report(analysis)
+        
+        # Generate and save commit prompt
+        print("\n=== Generated Commit Prompt ===")
+        prompt = generate_commit_prompt(analysis)
+        print(prompt)
+        print()
+        
+        prompt_file = save_commit_prompt(prompt)
+        if prompt_file:
+            print(f"This prompt will be used by prepare-commit-msg hook for consistent commit messages.")
+
+if __name__ == '__main__':
+    main()

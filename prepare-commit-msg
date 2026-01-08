@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# Load Ollama configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/ollama-common.sh"
-
 COMMIT_MSG_FILE=$1
 COMMIT_SOURCE=$2
 
@@ -26,50 +22,120 @@ fi
 
 echo "Diff found, calling LLM" >> /tmp/hook_debug.log
 
-# Check for custom commit prompt
-GIT_DIR=$(git rev-parse --git-dir)
-PROMPT_FILE="$GIT_DIR/commit-prompt.txt"
-
-if [ -f "$PROMPT_FILE" ]; then
-    CUSTOM_PROMPT=$(cat "$PROMPT_FILE")
-    echo "Using custom prompt from $PROMPT_FILE" >> /tmp/hook_debug.log
-else
-    CUSTOM_PROMPT="Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:"
-    echo "Using default prompt" >> /tmp/hook_debug.log
-fi
-
 # Generate commit message using LLM
 TEMP_DIFF=$(mktemp)
 echo "$DIFF" > "$TEMP_DIFF"
 
+# Load custom prompt if available
+GIT_DIR=$(git rev-parse --git-dir)
+PROMPT_FILE="$GIT_DIR/commit-prompt.txt"
+if [ -f "$PROMPT_FILE" ]; then
+    CUSTOM_PROMPT=$(cat "$PROMPT_FILE")
+else
+    CUSTOM_PROMPT="Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:"
+fi
+
 COMMIT_MSG=$(python3 -c "
-import json, subprocess, sys
+import json, subprocess, sys, re
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+def estimate_tokens(text):
+    # Rough token estimation: ~4 chars per token
+    return len(text) // 4
+
+def summarize_chunk(chunk, custom_prompt):
+    payload = {
+        'model': 'gemma3:1b',
+        'messages': [{
+            'role': 'user',
+            'content': f'Summarize the key changes in this diff chunk concisely:\\n\\n{chunk}'
+        }],
+        'max_tokens': 150,
+        'temperature': 0.3
+    }
+    
+    try:
+        result = subprocess.run(['curl', '-s', '-X', 'POST', 'http://localhost:11434/v1/chat/completions',
+                               '-H', 'Content-Type: application/json',
+                               '-d', json.dumps(payload)], 
+                              capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return data['choices'][0]['message']['content'].strip()
+    except:
+        pass
+    return 'Changes made'
 
 with open('$TEMP_DIFF', 'r') as f:
     diff = f.read()
 
 custom_prompt = '''$CUSTOM_PROMPT'''
+token_count = estimate_tokens(diff)
 
+if token_count > 1000:
+    # Split diff into chunks by file
+    file_chunks = re.split(r'(?=diff --git)', diff)
+    file_chunks = [chunk.strip() for chunk in file_chunks if chunk.strip()]
+    
+    summaries = []
+    
+    if len(file_chunks) > 3:
+        print(f'Summarizing {len(file_chunks)} diff chunks...', file=sys.stderr)
+        iterator = tqdm(file_chunks, desc='Progress', file=sys.stderr) if tqdm else file_chunks
+    else:
+        iterator = file_chunks
+    
+    for chunk in iterator:
+        if estimate_tokens(chunk) > 800:  # Still too large, split further
+            lines = chunk.split('\n')
+            sub_chunks = []
+            current_chunk = []
+            current_size = 0
+            
+            for line in lines:
+                line_size = estimate_tokens(line)
+                if current_size + line_size > 800 and current_chunk:
+                    sub_chunks.append('\n'.join(current_chunk))
+                    current_chunk = [line]
+                    current_size = line_size
+                else:
+                    current_chunk.append(line)
+                    current_size += line_size
+            
+            if current_chunk:
+                sub_chunks.append('\n'.join(current_chunk))
+            
+            for sub_chunk in sub_chunks:
+                summaries.append(summarize_chunk(sub_chunk, custom_prompt))
+        else:
+            summaries.append(summarize_chunk(chunk, custom_prompt))
+    
+    # Combine summaries
+    combined_summary = '\n'.join(summaries)
+    final_diff = f'Summary of changes:\n{combined_summary}'
+else:
+    final_diff = diff
+
+# Generate final commit message
 payload = {
-    'model': '$OLLAMA_MODEL',
+    'model': 'gemma3:1b',
     'messages': [{
         'role': 'user',
-        'content': f'{custom_prompt}\\n\\n{diff}'
+        'content': f'{custom_prompt}\\n\\n{final_diff}'
     }],
-    'max_tokens': $OLLAMA_MAX_TOKENS,
-    'temperature': $OLLAMA_TEMPERATURE
+    'max_tokens': 200,
+    'temperature': 0.3
 }
 
 try:
-    curl_cmd = ['curl', '-s', '-X', 'POST', 'http://$OLLAMA_HOST:$OLLAMA_PORT/v1/chat/completions',
-               '-H', 'Content-Type: application/json']
-    
-    if '$OLLAMA_API_TOKEN':
-        curl_cmd.extend(['-H', 'Authorization: Bearer $OLLAMA_API_TOKEN'])
-    
-    curl_cmd.extend(['-d', json.dumps(payload)])
-    
-    result = subprocess.run(curl_cmd, capture_output=True, text=True)
+    result = subprocess.run(['curl', '-s', '-X', 'POST', 'http://localhost:11434/v1/chat/completions',
+                           '-H', 'Content-Type: application/json',
+                           '-d', json.dumps(payload)], 
+                          capture_output=True, text=True)
     
     if result.returncode == 0:
         data = json.loads(result.stdout)
@@ -85,7 +151,36 @@ echo "LLM response: '$COMMIT_MSG'" >> /tmp/hook_debug.log
 
 # Prepend AI-generated message to existing commit message file
 if [ -n "$COMMIT_MSG" ]; then
-    echo "$COMMIT_MSG" > "$COMMIT_MSG_FILE.tmp"
+    # Load line length preference from prompt file
+    LINE_LENGTH=72  # default
+    if [ -f "$PROMPT_FILE" ]; then
+        LINE_LENGTH=$(grep -o "around [0-9]\+ characters" "$PROMPT_FILE" | grep -o "[0-9]\+" | tail -1)
+        if [ -z "$LINE_LENGTH" ]; then
+            LINE_LENGTH=72
+        fi
+    fi
+    
+    # Format commit message with proper line wrapping
+    python3 -c "
+import textwrap
+import sys
+
+commit_msg = '''$COMMIT_MSG'''
+line_length = int('$LINE_LENGTH')
+
+lines = commit_msg.split('\n')
+formatted_lines = []
+
+for line in lines:
+    if len(line.strip()) <= line_length:
+        formatted_lines.append(line)
+    else:
+        # Wrap long lines without breaking words
+        wrapped = textwrap.fill(line.strip(), width=line_length, break_long_words=False, break_on_hyphens=False)
+        formatted_lines.extend(wrapped.split('\n'))
+
+print('\n'.join(formatted_lines))
+" > "$COMMIT_MSG_FILE.tmp"
     echo "" >> "$COMMIT_MSG_FILE.tmp"
     cat "$COMMIT_MSG_FILE" >> "$COMMIT_MSG_FILE.tmp"
     mv "$COMMIT_MSG_FILE.tmp" "$COMMIT_MSG_FILE"

@@ -26,6 +26,18 @@ fi
 
 echo "Diff found, calling LLM" >> /tmp/hook_debug.log
 
+# Check for custom commit prompt
+GIT_DIR=$(git rev-parse --git-dir)
+PROMPT_FILE="$GIT_DIR/commit-prompt.txt"
+
+if [ -f "$PROMPT_FILE" ]; then
+    CUSTOM_PROMPT=$(cat "$PROMPT_FILE")
+    echo "Using custom prompt from $PROMPT_FILE" >> /tmp/hook_debug.log
+else
+    CUSTOM_PROMPT="Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:"
+    echo "Using default prompt" >> /tmp/hook_debug.log
+fi
+
 # Generate commit message using LLM
 TEMP_DIFF=$(mktemp)
 echo "$DIFF" > "$TEMP_DIFF"
@@ -36,11 +48,13 @@ import json, subprocess, sys
 with open('$TEMP_DIFF', 'r') as f:
     diff = f.read()
 
+custom_prompt = '''$CUSTOM_PROMPT'''
+
 payload = {
     'model': '$OLLAMA_MODEL',
     'messages': [{
         'role': 'user',
-        'content': f'Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:\\n\\n{diff}'
+        'content': f'{custom_prompt}\\n\\n{diff}'
     }],
     'max_tokens': $OLLAMA_MAX_TOKENS,
     'temperature': $OLLAMA_TEMPERATURE
@@ -56,9 +70,6 @@ try:
     curl_cmd.extend(['-d', json.dumps(payload)])
     
     result = subprocess.run(curl_cmd, capture_output=True, text=True)
-                           '-H', 'Content-Type: application/json',
-                           '-d', json.dumps(payload)], 
-                          capture_output=True, text=True)
     
     if result.returncode == 0:
         data = json.loads(result.stdout)

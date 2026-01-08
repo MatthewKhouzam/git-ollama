@@ -3,23 +3,31 @@
 # git-add-llm: Interactive git add with LLM explanations
 # Usage: git-add-llm [files...]
 
-LLM_HOST="127.0.0.1"
-LLM_PORT="11434"
+# Load Ollama configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/ollama-common.sh"
 
 explain_chunk() {
     local chunk="$1"
     local escaped_chunk=$(echo "$chunk" | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n')
     
-    local response=$(curl -s -X POST "http://${LLM_HOST}:${LLM_PORT}/v1/chat/completions" \
+    # Build auth header if token exists
+    local auth_header=""
+    if [ -n "$OLLAMA_API_TOKEN" ]; then
+        auth_header="-H \"Authorization: Bearer $OLLAMA_API_TOKEN\""
+    fi
+    
+    local response=$(curl -s -X POST "http://${OLLAMA_HOST}:${OLLAMA_PORT}/v1/chat/completions" \
         -H "Content-Type: application/json" \
+        ${auth_header} \
         -d "{
-            \"model\": \"gemma3:1b\",
+            \"model\": \"${OLLAMA_MODEL}\",
             \"messages\": [{
                 \"role\": \"user\",
                 \"content\": \"Briefly explain what this code change does in 1-2 sentences:\\n\\n${escaped_chunk}\"
             }],
-            \"max_tokens\": 100,
-            \"temperature\": 0.3
+            \"max_tokens\": ${OLLAMA_MAX_TOKENS},
+            \"temperature\": ${OLLAMA_TEMPERATURE}
         }")
     
     echo "$response" | python3 -c "

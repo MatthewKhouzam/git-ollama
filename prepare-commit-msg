@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Load Ollama configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/ollama-common.sh"
+
 COMMIT_MSG_FILE=$1
 COMMIT_SOURCE=$2
 
@@ -33,17 +37,25 @@ with open('$TEMP_DIFF', 'r') as f:
     diff = f.read()
 
 payload = {
-    'model': 'gemma3:1b',
+    'model': '$OLLAMA_MODEL',
     'messages': [{
         'role': 'user',
         'content': f'Generate a concise git commit message for this diff. Use conventional commit format (feat:, fix:, docs:, etc.). Be specific about what changed:\\n\\n{diff}'
     }],
-    'max_tokens': 100,
-    'temperature': 0.3
+    'max_tokens': $OLLAMA_MAX_TOKENS,
+    'temperature': $OLLAMA_TEMPERATURE
 }
 
 try:
-    result = subprocess.run(['curl', '-s', '-X', 'POST', 'http://localhost:11434/v1/chat/completions',
+    curl_cmd = ['curl', '-s', '-X', 'POST', 'http://$OLLAMA_HOST:$OLLAMA_PORT/v1/chat/completions',
+               '-H', 'Content-Type: application/json']
+    
+    if '$OLLAMA_API_TOKEN':
+        curl_cmd.extend(['-H', 'Authorization: Bearer $OLLAMA_API_TOKEN'])
+    
+    curl_cmd.extend(['-d', json.dumps(payload)])
+    
+    result = subprocess.run(curl_cmd, capture_output=True, text=True)
                            '-H', 'Content-Type: application/json',
                            '-d', json.dumps(payload)], 
                           capture_output=True, text=True)

@@ -125,7 +125,7 @@ payload = {
     'model': 'gemma3:1b',
     'messages': [{
         'role': 'user',
-        'content': f'{custom_prompt}\\n\\n{final_diff}'
+        'content': f'{final_diff}\\n\\n{custom_prompt}'
     }],
     'max_tokens': 200,
     'temperature': 0.3
